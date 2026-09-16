@@ -40,6 +40,12 @@ $ExePath  = Join-Path $ScriptDir 'rustdesk.exe'
 $TomlDir  = Join-Path $env:APPDATA 'RustDesk\config'
 $TomlPath = Join-Path $TomlDir 'RustDesk2.toml'
 
+# 服务级配置：RustDesk 装成系统服务后（非便携模式），服务读的是这里而不是用户目录。
+# 只写用户目录的话，「先配好便携客户端 → 再点『安装』装成服务」时，
+# 服务仍会拿旧配置或空配置去注册，表现为界面填的服务器地址不生效。
+$SvcTomlDir  = Join-Path $env:ProgramData 'RustDesk\config'
+$SvcTomlPath = Join-Path $SvcTomlDir 'RustDesk2.toml'
+
 # ============== 预设值 ==============
 # make-package.ps1 生成客户端包时会自动替换下面三个值。
 # 也可以直接改同目录的 服务器设置.ini（那个优先）。
@@ -93,6 +99,17 @@ function Set-TomlKey {
     [void]$Lines.Add("$Key = '$Value'")
 }
 
+# 写 TOML 整数（不加引号）。nat_type / serial 在 RustDesk 里是整数类型，
+# 写成 '1' 这种带引号的字符串会变成字符串，类型对不上。
+function Set-TomlInt {
+    param($Lines, [string]$Key, [int]$Value)
+    $pattern = '^\s*' + [regex]::Escape($Key) + '\s*='
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i] -match $pattern) { $Lines[$i] = "$Key = $Value"; return }
+    }
+    [void]$Lines.Add("$Key = $Value")
+}
+
 function Write-TomlFile {
     param($Cfg, [string]$Path)
     $out = New-Object System.Collections.ArrayList
@@ -117,10 +134,20 @@ function Stop-RustDesk {
 }
 
 function Apply-Config {
+    param($Cfg, [string]$Path)
+    if (Test-Path $Path) { Copy-Item $Path "$Path.bak" -Force }
+    Write-TomlFile -Cfg $Cfg -Path $Path
+}
+
+# 生成一份配置内容（不落盘），供用户级/服务级两个位置复用
+function New-Config {
     param([string]$IdServer, [string]$RelayServer, [string]$Key)
-    if (-not (Test-Path $TomlDir)) { New-Item -ItemType Directory -Path $TomlDir -Force | Out-Null }
     $cfg = Read-TomlFile -Path $TomlPath
+    # 带端口：与 RustDesk 注册成功后自己回写的格式一致（<ip>:21116）
     Set-TomlKey -Lines $cfg.Top -Key 'rendezvous_server' -Value ("{0}:21116" -f $IdServer)
+    # 这两个字段 RustDesk 运行时会自动补齐；写成整数（不加引号）与实测生效配置一致
+    Set-TomlInt -Lines $cfg.Top -Key 'nat_type' -Value 1
+    Set-TomlInt -Lines $cfg.Top -Key 'serial'   -Value 0
     if (-not $cfg.Sections.Contains('options')) {
         $cfg.Sections['options'] = New-Object System.Collections.ArrayList
         [void]$cfg.Order.Add('options')
@@ -129,8 +156,23 @@ function Apply-Config {
     Set-TomlKey -Lines $opt -Key 'custom-rendezvous-server' -Value $IdServer
     Set-TomlKey -Lines $opt -Key 'relay-server'           -Value $RelayServer
     Set-TomlKey -Lines $opt -Key 'key'                    -Value $Key
-    if (Test-Path $TomlPath) { Copy-Item $TomlPath "$TomlPath.bak" -Force }
-    Write-TomlFile -Cfg $cfg -Path $TomlPath
+    return $cfg
+}
+
+# 回读已写入的文件，确认三项设置真的落盘且内容正确。
+# 这样「一键配置」失败时会明确报错，而不是等用户看到「未就绪」再回头猜。
+function Test-ConfigWritten {
+    param([string]$Path, [string]$IdServer, [string]$RelayServer, [string]$Key)
+    if (-not (Test-Path $Path)) { return $false }
+    $c = Read-TomlFile -Path $Path
+    $opt = $c.Sections['options']
+    if ((Get-TomlKey -Lines $c.Top -Key 'rendezvous_server') -ne ("{0}:21116" -f $IdServer)) { return $false }
+    if ((Get-TomlKey -Lines $opt -Key 'custom-rendezvous-server') -ne $IdServer) { return $false }
+    if ((Get-TomlKey -Lines $opt -Key 'relay-server') -ne $RelayServer) { return $false }
+    if ((Get-TomlKey -Lines $opt -Key 'key') -ne $Key) { return $false }
+    if ((Get-TomlKey -Lines $c.Top -Key 'nat_type') -ne '1') { return $false }
+    if ((Get-TomlKey -Lines $c.Top -Key 'serial')   -ne '0') { return $false }
+    return $true
 }
 
 function Save-Ini {
@@ -260,12 +302,46 @@ if ($IdServer -eq '<YOUR_SERVER_IP>') {
 }
 
 Stop-RustDesk
-Apply-Config -IdServer $IdServer -RelayServer $RelayServer -Key $Key
-Save-Ini     -IdServer $IdServer -RelayServer $RelayServer -Key $Key
+
+# --- 1) 用户级配置（便携模式读这里） ---
+if (-not (Test-Path $TomlDir)) { New-Item -ItemType Directory -Path $TomlDir -Force | Out-Null }
+$cfg = New-Config -IdServer $IdServer -RelayServer $RelayServer -Key $Key
+Apply-Config -Cfg $cfg -Path $TomlPath
+
+if (-not (Test-ConfigWritten -Path $TomlPath -IdServer $IdServer -RelayServer $RelayServer -Key $Key)) {
+    Write-Host "错误：配置写入后校验不通过：$TomlPath" -ForegroundColor Red
+    Write-Host '      请检查该文件是否被占用或权限不足。' -ForegroundColor Red
+    exit 1
+}
+
+# --- 2) 服务级配置（装成系统服务后读这里） ---
+$svcWritten = $false
+$svcNote    = ''
+if (Test-Path $SvcTomlDir) {
+    try {
+        Apply-Config -Cfg $cfg -Path $SvcTomlPath
+        if (Test-ConfigWritten -Path $SvcTomlPath -IdServer $IdServer -RelayServer $RelayServer -Key $Key) {
+            $svcWritten = $true
+        } else {
+            $svcNote = '服务级配置写入后校验不通过'
+        }
+    } catch {
+        $svcNote = "服务级配置写入失败：$($_.Exception.Message)"
+    }
+} else {
+    $svcNote = '本机未安装 RustDesk 服务，已跳过（便携模式不受影响）'
+}
+
+Save-Ini -IdServer $IdServer -RelayServer $RelayServer -Key $Key
+
+$svcLine = if ($svcWritten) { "已同步写入 $SvcTomlPath" }
+           elseif ($svcNote) { "服务级配置未写入：$svcNote" }
+           else { '服务级配置未写入' }
 
 $summary = @"
-配置已写入：
+配置已写入并校验通过：
 $TomlPath
+$svcLine
 
   ID 服务器   : $IdServer
   中继服务器  : $RelayServer
@@ -275,6 +351,12 @@ $TomlPath
 "@
 
 Write-Host $summary -ForegroundColor Green
+
+# 需要写服务级配置但没有管理员权限时，明确提示，避免「装了服务却不生效」
+if (-not $svcWritten -and $svcNote -match '拒绝|denied|Unauthorized') {
+    Write-Host '提示：服务级配置需要管理员权限。若稍后要把 RustDesk 装成系统服务，' -ForegroundColor Yellow
+    Write-Host '      请右键本脚本「以管理员身份运行」重新配置一次。' -ForegroundColor Yellow
+}
 
 if (-not $Silent) {
     Add-Type -AssemblyName System.Windows.Forms
