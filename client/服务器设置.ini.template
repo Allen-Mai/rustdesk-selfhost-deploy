@@ -1,0 +1,5 @@
+﻿# RustDesk 服务器设置（改完保存，双击 bat 就会用这里的值）
+# make-package.ps1 生成客户端包时会自动填写下面三项
+ID_SERVER=<YOUR_SERVER_IP>
+RELAY_SERVER=<YOUR_SERVER_IP>
+KEY=<YOUR_PUBLIC_KEY>

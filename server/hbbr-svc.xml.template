@@ -1,0 +1,33 @@
+<!--
+  hbbr（中继服务器）的 WinSW 服务配置模板
+
+  安装脚本会替换以下占位符后使用：
+    {{INSTALL_DIR}}   安装目录
+
+  注意：
+    - hbbr 不需要 -r 参数（中继地址是给 hbbs 用的）
+    - workingdirectory 必须和 hbbs 一致，否则读不到同一个 id_ed25519 私钥
+-->
+<service>
+  <id>rustdesk-hbbr</id>
+  <name>RustDesk Relay Server (hbbr)</name>
+  <description>RustDesk 中继服务器。监听 TCP 21117，以及 TCP 21119（网页客户端）。</description>
+
+  <executable>{{INSTALL_DIR}}\hbbr.exe</executable>
+  <arguments>-k _</arguments>
+  <workingdirectory>{{INSTALL_DIR}}</workingdirectory>
+
+  <logpath>{{INSTALL_DIR}}\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+
+  <onfailure action="restart" delay="10 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  <stoptimeout>15 sec</stoptimeout>
+
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>false</delayedAutoStart>
+  <priority>Normal</priority>
+</service>
